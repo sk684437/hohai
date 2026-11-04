@@ -55,7 +55,7 @@ CARD = '[data-checkin-card="dashboard"]'
 # 每个账号允许覆盖的全局配置键
 ACCOUNT_OVERRIDE_KEYS = (
     "proxy", "tg_bot_token", "tg_chat_id", "tg_proxy",
-    "headless", "timeout", "use_cdp", "keep_open",
+    "headless", "timeout", "use_cdp",
 )
 
 # 读取 Turnstile 通过后生成的 token（兼容自定义 container 与隐藏 input）
@@ -154,7 +154,6 @@ def load_config() -> dict:
         "tg_chat_id": "",
         "tg_proxy": "",
         "use_cdp": "true",
-        "keep_open": "false",
         "account_delay": "",
     }
     ini = ROOT / "config.ini"
@@ -176,7 +175,6 @@ def load_config() -> dict:
         "HOHAI_TG_CHAT_ID": "tg_chat_id",
         "HOHAI_TG_PROXY": "tg_proxy",
         "HOHAI_USE_CDP": "use_cdp",
-        "HOHAI_KEEP_OPEN": "keep_open",
         "HOHAI_ACCOUNT_DELAY": "account_delay",
         # 兼容常见别名
         "EMAIL": "username",
@@ -726,13 +724,18 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                                 currency=body.get("currencyUnit"),
                                 reason="前端提交成功",
                             )
-                            log(f"签到成功，奖励 {body.get('amount')} {body.get('currencyUnit')}")
+                            # 余额只在签到 POST 响应里，站点其它接口都不返回
+                            if body.get("balance") is not None:
+                                result["balance"] = body.get("balance")
+                            log(f"签到成功，奖励 {body.get('amount')} {body.get('currencyUnit')}，余额 {body.get('balance')}")
                             time.sleep(1.5)
                             _shoot(page, "checkin_success")
                             log("已截图，随后关闭浏览器")
                             return result
                         if h["status"] == 400 and body.get("hasCheckedIn"):
                             result.update(ok=True, already=True, amount=body.get("amount"))
+                            if body.get("balance") is not None:
+                                result["balance"] = body.get("balance")
                             _shoot(page, "already_done")
                             log("重复签到：今日已签到")
                             return result
@@ -742,6 +745,8 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                         plain = [h for h in hits if h["status"] == 200]
                         if plain:
                             result.update(ok=True, amount=plain[-1]["body"].get("amount"))
+                            if plain[-1]["body"].get("balance") is not None:
+                                result["balance"] = plain[-1]["body"].get("balance")
                         else:
                             result.update(ok=True, already=True)
                         _shoot(page, "checkin_success")
@@ -826,9 +831,6 @@ def browser_checkin(cfg: dict, token: str) -> dict:
             result["reason"] = f"浏览器流程异常：{exc}"
             return result
         finally:
-            if truthy(cfg.get("keep_open")):
-                log("keep_open=true，浏览器保持打开 60 秒")
-                time.sleep(60)
             try:
                 if browser is not None:
                     browser.close()
@@ -872,7 +874,7 @@ def run_account(cfg: dict, args) -> dict:
     st = api_status(sess, cfg, token)
     log(f"签到状态：{json.dumps(st, ensure_ascii=False)[:300]}")
 
-    if st.get("hasCheckedInToday") and not args.force:
+    if st.get("hasCheckedInToday"):
         res.update(code=0, ok=True, already=True,
                    amount=st.get("amount"), currency=st.get("currencyUnit"),
                    balance=st.get("balance"))
@@ -891,8 +893,12 @@ def run_account(cfg: dict, args) -> dict:
         log(f"API 提交结果 HTTP {code}: {json.dumps(body, ensure_ascii=False)[:300]}")
         if code == 200 and body.get("success"):
             result.update(ok=True, amount=body.get("amount"), currency=body.get("currencyUnit"))
+            if body.get("balance") is not None:
+                result["balance"] = body.get("balance")
         elif code == 400 and body.get("hasCheckedIn"):
             result.update(ok=True, already=True, amount=body.get("amount"))
+            if body.get("balance") is not None:
+                result["balance"] = body.get("balance")
 
     st2: dict = {}
     if result.get("ok"):
@@ -950,7 +956,6 @@ def main() -> int:
     ap.add_argument("--headed", action="store_true", help="强制显示浏览器窗口")
     ap.add_argument("--smoke", action="store_true", help="只测试浏览器能否启动")
     ap.add_argument("--token", default="", help="直接使用已有 auth_token（跳过账号密码登录，调试用）")
-    ap.add_argument("--force", action="store_true", help="即使今日已签到也打开浏览器走一遍（调试用）")
     ap.add_argument("--account", default="", help="只跑指定账号：标签、用户名或序号（1 起）")
     ap.add_argument("--list", action="store_true", help="列出已配置的账号后退出")
     args = ap.parse_args()
@@ -1020,10 +1025,14 @@ def main() -> int:
         res = run_account(cfg_i, args)
         summary.append((acc["label"], res))
 
-        # 每个账号单独推一条（带账号前缀 + 各自截图）
-        body = _acc_text(res)
-        notify(cfg_i, f"[{acc['label']}] HOHAI {body}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-               photo=STATE.get("last_shot"))
+        # 每个账号单独推一条（带账号前缀 + 各自截图）；
+        # HOHAI_QUIET_ALREADY=true 时已签到不推（本地计划任务与 Actions 双跑时避免重复轰炸）
+        if res.get("ok") and res.get("already") and truthy(os.environ.get("HOHAI_QUIET_ALREADY", "")):
+            log("已签到且设置了 HOHAI_QUIET_ALREADY，跳过该账号通知")
+        else:
+            body = _acc_text(res)
+            notify(cfg_i, f"[{acc['label']}] HOHAI {body}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+                   photo=STATE.get("last_shot"))
 
         if i < len(accounts) - 1:
             try:
