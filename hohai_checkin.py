@@ -876,8 +876,7 @@ def run_account(cfg: dict, args) -> dict:
 
     if st.get("hasCheckedInToday"):
         res.update(code=0, ok=True, already=True,
-                   amount=st.get("amount"), currency=st.get("currencyUnit"),
-                   balance=st.get("balance"))
+                   amount=st.get("amount"), currency=st.get("currencyUnit"))
         log("今日已签到")
         return res
     if args.status:
@@ -900,18 +899,11 @@ def run_account(cfg: dict, args) -> dict:
             if body.get("balance") is not None:
                 result["balance"] = body.get("balance")
 
-    st2: dict = {}
-    if result.get("ok"):
+    # 复核：确认签到真的生效（余额只认签到 POST 响应里带的，不额外查接口）
+    if result.get("ok") and not result.get("already"):
         time.sleep(2)
         st2 = api_status(sess, cfg, token)
         log(f"复核签到状态：{json.dumps(st2, ensure_ascii=False)[:300]}")
-        if result.get("already"):
-            # 浏览器侧判定已签到：用 status 接口补全今日奖励与余额
-            res.update(code=0, ok=True, already=True,
-                       amount=result.get("amount") or st2.get("amount"),
-                       currency=result.get("currency") or st2.get("currencyUnit"),
-                       balance=st2.get("balance"))
-            return res
         if not st2.get("hasCheckedInToday"):
             result.update(ok=False, reason="响应看似成功，但复核仍是未签到")
         else:
@@ -921,7 +913,7 @@ def run_account(cfg: dict, args) -> dict:
     if result.get("ok"):
         res.update(code=0, ok=True, already=bool(result.get("already")),
                    amount=result.get("amount"), currency=result.get("currency"),
-                   balance=st2.get("balance") or result.get("balance"))
+                   balance=result.get("balance"))
         if not result.get("already"):
             log(f"签到成功：+{result.get('amount')} {result.get('currency')}")
         return res
