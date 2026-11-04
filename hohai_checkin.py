@@ -895,10 +895,17 @@ def run_account(cfg: dict, args) -> dict:
             result.update(ok=True, already=True, amount=body.get("amount"))
 
     st2: dict = {}
-    if result.get("ok") and not result.get("already"):
+    if result.get("ok"):
         time.sleep(2)
         st2 = api_status(sess, cfg, token)
         log(f"复核签到状态：{json.dumps(st2, ensure_ascii=False)[:300]}")
+        if result.get("already"):
+            # 浏览器侧判定已签到：用 status 接口补全今日奖励与余额
+            res.update(code=0, ok=True, already=True,
+                       amount=result.get("amount") or st2.get("amount"),
+                       currency=result.get("currency") or st2.get("currencyUnit"),
+                       balance=st2.get("balance"))
+            return res
         if not st2.get("hasCheckedInToday"):
             result.update(ok=False, reason="响应看似成功，但复核仍是未签到")
         else:
@@ -921,11 +928,16 @@ def run_account(cfg: dict, args) -> dict:
 def _acc_text(res: dict) -> str:
     """把单账号结果拼成一行可读文本。"""
     if res.get("ok") and res.get("already"):
-        return "已签到（重复执行）"
+        parts = ["今日已签到"]
+        if res.get("amount") is not None:
+            parts.append(f"今日奖励 +{res.get('amount')} {res.get('currency') or ''}".rstrip())
+        if res.get("balance") is not None:
+            parts.append(f"当前余额 {res.get('balance')} {res.get('currency') or ''}".rstrip())
+        return "，".join(parts)
     if res.get("ok"):
         line = f"签到成功，奖励 +{res.get('amount')} {res.get('currency') or ''}".rstrip()
         if res.get("balance") is not None:
-            line += f"，余额 {res['balance']} {res.get('currency') or ''}".rstrip()
+            line += f"，当前余额 {res['balance']} {res.get('currency') or ''}".rstrip()
         return line
     return f"失败：{res.get('reason') or '未知原因'}"
 
