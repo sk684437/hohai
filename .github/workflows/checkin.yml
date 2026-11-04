@@ -6,11 +6,6 @@ on:
     # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
     - cron: "5 16 * * *"
   workflow_dispatch:
-    inputs:
-      force:
-        description: "今日已签到也强制打开浏览器走一遍（调试用）"
-        type: boolean
-        default: false
 
 # 同一时间只跑一个，避免两次运行同时点签到
 concurrency:
@@ -114,12 +109,11 @@ jobs:
           HOHAI_HEADLESS: ${{ vars.HOHAI_HEADLESS }}
           HOHAI_USE_CDP: ${{ vars.HOHAI_USE_CDP }}
           HOHAI_NO_SANDBOX: ${{ vars.HOHAI_NO_SANDBOX }}
-          HOHAI_KEEP_OPEN: ${{ vars.HOHAI_KEEP_OPEN }}
+          HOHAI_ACCOUNT_DELAY: ${{ vars.HOHAI_ACCOUNT_DELAY }}
           # 已签到时不重复推 TG（本地计划任务与 Actions 双跑时只推一次）
           HOHAI_QUIET_ALREADY: "true"
         run: |
-          xvfb-run -a -s "-screen 0 1920x1080x24" \
-            python -u hohai_checkin.py ${{ inputs.force && '--force' || '' }}
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -u hohai_checkin.py
 
       - name: 📝 更新 README 时间 (防止 Action 休眠)
         if: always()
