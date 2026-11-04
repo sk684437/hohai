@@ -25,7 +25,8 @@ permissions:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 多账号串行：每个账号最坏 ~timeout(180s)+浏览器开销，放宽到 60 分钟
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -97,7 +98,9 @@ jobs:
       - name: 执行签到（真实 Chrome + CDP 接管，xvfb 虚拟屏）
         env:
           TZ: Asia/Shanghai
-          # —— 必填（Settings → Secrets and variables → Actions → Secrets）——
+          # —— 多账号（推荐）：Secret HOHAI_ACCOUNTS，格式 `用户名1:密码1;用户名2:密码2` ——
+          HOHAI_ACCOUNTS: ${{ secrets.HOHAI_ACCOUNTS }}
+          # —— 单账号（兼容旧配置；配了 HOHAI_ACCOUNTS 时可留空）——
           HOHAI_USERNAME: ${{ secrets.HOHAI_USERNAME }}
           HOHAI_PASSWORD: ${{ secrets.HOHAI_PASSWORD }}
           # 注意：Secret 名叫 TG_BOT_TOKEN，脚本读的环境变量叫 HOHAI_TG_BOT_TOKEN
