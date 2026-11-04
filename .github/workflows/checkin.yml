@@ -2,8 +2,8 @@ name: HOHAI 每日签到
 
 on:
   schedule:
-    # UTC 00:05 = 北京时间 08:05，每天一次
-    # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
+    # UTC 00:05 = 北京时间 08:05
+    # GitHub 定时任务高峰期会延迟 5~30 分钟，属正常现象
     - cron: "5 0 * * *"
   workflow_dispatch:
     inputs:
@@ -23,7 +23,8 @@ permissions:
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 单次约 4 分钟；最多重试 3 次 + 装 WARP，留足余量
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -48,15 +49,70 @@ jobs:
           sudo apt-get install -y -qq xvfb fonts-noto-cjk >/dev/null
           google-chrome --version
           echo "---"
-          # Turnstile 的挑战域名必须直连可达，否则盾永远过不去
-          curl -s -o /dev/null -w "challenges.cloudflare.com -> %{http_code}\n" https://challenges.cloudflare.com/turnstile/v0/api.js || true
+          # Turnstile 的挑战域名必须可达，否则盾永远过不去
+          curl -s -o /dev/null -w "challenges.cloudflare.com -> %{http_code}\n" \
+            --max-time 15 https://challenges.cloudflare.com/turnstile/v0/api.js || true
+
+      - name: 接入 Cloudflare WARP（出口换成 CF 网络）
+        # 机房 IP 直接过盾命中率低；WARP 免费、出口就是 Cloudflare 自己的网络。
+        # 想关掉：仓库 Variables 里设 HOHAI_USE_WARP=false
+        if: vars.HOHAI_USE_WARP != 'false'
+        continue-on-error: true
+        env:
+          MANUAL_PROXY: ${{ vars.HOHAI_PROXY }}
+        run: |
+          # Variables 里手填了代理就以手动为准，不再折腾 WARP
+          if [ -n "$MANUAL_PROXY" ]; then
+            echo "HOHAI_PROXY=$MANUAL_PROXY" >> "$GITHUB_ENV"
+            echo "使用 Variables 指定的代理：$MANUAL_PROXY"
+            exit 0
+          fi
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cloudflare-warp
+          sudo systemctl start warp-svc || true
+          sleep 3
+          warp-cli --accept-tos registration new || true
+          # proxy 模式：本地起 SOCKS5，Chrome 和 requests 都能用
+          warp-cli --accept-tos mode proxy || true
+          warp-cli --accept-tos connect || true
+          sleep 6
+          if timeout 5 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/40000' 2>/dev/null; then
+            echo "HOHAI_PROXY=socks5://127.0.0.1:40000" >> "$GITHUB_ENV"
+            echo "WARP SOCKS5 就绪：127.0.0.1:40000"
+          else
+            echo "WARP 没起来，本次直连"
+          fi
 
       - name: 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip -q
           pip install -q -r requirements.txt
 
-      - name: 执行签到（真实 Chrome + CDP 接管，xvfb 虚拟屏）
+      - name: 打印本次出口
+        env:
+          MANUAL_TG_PROXY: ${{ vars.HOHAI_TG_PROXY }}
+        run: |
+          echo "直链出口："
+          curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp)=' || true
+          if [ -n "${HOHAI_PROXY:-}" ]; then
+            echo "签到将走代理：$HOHAI_PROXY"
+          else
+            echo "签到将直连（未启用 WARP 或 WARP 未就绪）"
+          fi
+          # TG 的发包代理：没单独配就复用已确认可用的签到代理
+          if [ -n "$MANUAL_TG_PROXY" ]; then
+            echo "HOHAI_TG_PROXY=$MANUAL_TG_PROXY" >> "$GITHUB_ENV"
+            echo "TG 走 Variables 指定的代理：$MANUAL_TG_PROXY"
+          elif [ -n "${HOHAI_PROXY:-}" ]; then
+            echo "HOHAI_TG_PROXY=$HOHAI_PROXY" >> "$GITHUB_ENV"
+            echo "TG 复用签到代理：$HOHAI_PROXY"
+          fi
+
+      - name: 执行签到（真实 Chrome + CDP，最多 3 次）
         env:
           TZ: Asia/Shanghai
           # —— 必填（Settings → Secrets and variables → Actions → Secrets）——
@@ -67,18 +123,35 @@ jobs:
           HOHAI_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           # —— 可选（同名 Variables；没建就是空，脚本自动用默认值）——
           HOHAI_BASE_URL: ${{ vars.HOHAI_BASE_URL }}
-          HOHAI_PROXY: ${{ vars.HOHAI_PROXY }}
-          HOHAI_TG_PROXY: ${{ vars.HOHAI_TG_PROXY }}
+          # 代理不在这里配：WARP 就绪时上一步已写进 GITHUB_ENV，
+          # 要用固定代理就在 Variables 里设 HOHAI_PROXY / HOHAI_TG_PROXY
           HOHAI_TIMEOUT: ${{ vars.HOHAI_TIMEOUT }}
-          HOHAI_HEADLESS: ${{ vars.HOHAI_HEADLESS }}
-          HOHAI_USE_CDP: ${{ vars.HOHAI_USE_CDP }}
-          HOHAI_NO_SANDBOX: ${{ vars.HOHAI_NO_SANDBOX }}
+          # runner 里 Chrome 必须无沙箱启动，否则起不来；本地跑不需要
+          HOHAI_NO_SANDBOX: ${{ vars.HOHAI_NO_SANDBOX || 'true' }}
+          # 真实 Chrome + xvfb 才过得了盾，这两项在 CI 里不能是 headless
+          HOHAI_HEADLESS: ${{ vars.HOHAI_HEADLESS || 'false' }}
+          HOHAI_USE_CDP: ${{ vars.HOHAI_USE_CDP || 'true' }}
           HOHAI_KEEP_OPEN: ${{ vars.HOHAI_KEEP_OPEN }}
-          # 已签到时不重复推 TG（本地计划任务与 Actions 双跑时只推一次）
-          HOHAI_QUIET_ALREADY: "true"
+          # 这里是主力，签没签到都要有回执；本地也跑的话把它设成 true 去重
+          HOHAI_QUIET_ALREADY: "false"
         run: |
-          xvfb-run -a -s "-screen 0 1920x1080x24" \
-            python -u hohai_checkin.py ${{ inputs.force && '--force' || '' }}
+          for attempt in 1 2 3; do
+            echo "::group::第 $attempt 次尝试"
+            set +e
+            xvfb-run -a -s "-screen 0 1920x1080x24" \
+              python -u hohai_checkin.py ${{ inputs.force && '--force' || '' }}
+            code=$?
+            set -e
+            echo "::endgroup::"
+            if [ "$code" -eq 0 ]; then
+              echo "第 $attempt 次成功"
+              exit 0
+            fi
+            echo "第 $attempt 次失败（exit=$code）"
+            if [ "$attempt" -lt 3 ]; then sleep 30; fi
+          done
+          echo "三次都没成功"
+          exit 1
 
       - name: 上传截图与日志
         if: always()
