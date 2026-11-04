@@ -127,13 +127,11 @@ jobs:
           git add README.md
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 更新签到时间保活 [skip ci]" && git push)
 
-      - name: 上传截图与日志
+      - name: 上传运行日志（截图只发 TG，不进公开 artifact）
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hohai-screenshots-${{ github.run_id }}
-          path: |
-            screenshots/
-            logs/
+          name: hohai-logs-${{ github.run_id }}
+          path: logs/
           if-no-files-found: ignore
           retention-days: 7
