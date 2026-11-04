@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import hashlib
 import json
 import os
 import random
@@ -140,6 +141,32 @@ def _safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_", str(s))[:40] or "acct"
 
 
+def _mask_account(u: str) -> str:
+    """账号打码：a***@q***.com#3f2a。
+
+    首字母 + 域名首字母 + 用户名稳定哈希前 4 位——同账号每次相同、
+    不同账号可区分，但从日志 / TG / Actions 公开日志里认不出具体是哪个号。
+    """
+    u = (u or "").strip()
+    if not u:
+        return "***"
+    h = hashlib.md5(u.encode("utf-8")).hexdigest()[:4]
+    if "@" in u:
+        local, _, dom = u.partition("@")
+        lp = (local[:1] + "***") if local else "***"
+        dp = (dom[:1] + "***") if dom else "***"
+        return f"{lp}@{dp}#{h}"
+    return f"{u[:1]}***#{h}"
+
+
+def _display_label(label: str, username: str) -> str:
+    """标签即用户名（或含 @）时打码，自定义标签（main / vip）原样保留。"""
+    label = (label or "").strip()
+    if not label or label == username or "@" in label:
+        return _mask_account(username)
+    return label
+
+
 # ---------------------------------------------------------------- 配置
 
 def load_config() -> dict:
@@ -213,11 +240,11 @@ def load_accounts(cfg: dict) -> list[dict]:
         if not username:
             return
         if username in seen:
-            log(f"账号 {username} 重复配置，忽略后出现的（标签 {label}）")
+            log(f"账号 {_mask_account(username)} 重复配置，忽略后出现的")
             return
         seen.add(username)
         entries.append({
-            "label": (label or username).strip(),
+            "label": _display_label(label, username),
             "username": username,
             "password": (password or "").strip(),
             "overrides": overrides or {},
@@ -257,8 +284,8 @@ def load_accounts(cfg: dict) -> list[dict]:
         target = next((e for e in entries if e["username"] == username and username), None)
         if target:
             target["overrides"].update(overrides)
-            target["label"] = label
-            log(f"账号 {username} 的覆盖配置已合并（标签 {label}）")
+            target["label"] = _display_label(label, username)
+            log(f"账号 {_mask_account(username)} 的覆盖配置已合并（标签 {target['label']}）")
         else:
             add(label, username, password, overrides)
 
@@ -307,7 +334,7 @@ def api_login(sess: requests.Session, cfg: dict) -> str:
     if not token:
         raise RuntimeError(f"登录响应缺少 token: {json.dumps(data, ensure_ascii=False)[:300]}")
     user = data.get("user") or {}
-    log(f"登录成功：{user.get('userName') or cfg['username']}")
+    log(f"登录成功：{_mask_account(user.get('userName') or cfg['username'])}")
     return token
 
 
@@ -959,7 +986,7 @@ def main() -> int:
         log(f"共配置 {len(accounts)} 个账号：")
         for i, acc in enumerate(accounts):
             extra = f"（覆盖：{', '.join(sorted(acc['overrides']))}）" if acc["overrides"] else ""
-            log(f"  {i + 1}. [{acc['label']}] {acc['username']}{extra}")
+            log(f"  {i + 1}. [{acc['label']}] {_mask_account(acc['username'])}{extra}")
         return 0
 
     if args.account:
