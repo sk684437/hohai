@@ -1,0 +1,92 @@
+name: EOOS 每日签到
+
+on:
+  schedule:
+    # UTC 16:35 = 北京时间 00:35，每天一次（与 hohai 的 00:05 错开，避免并发推 TG）
+    # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
+    - cron: "35 16 * * *"
+  workflow_dispatch:
+
+# 同一时间只跑一个，避免两次运行同时提交签到
+concurrency:
+  group: eoos-checkin
+  cancel-in-progress: false
+
+permissions:
+  actions: write  # 删历史 run 用；纯 API 签到无 git push，不需要 contents
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    # 纯 API 模式：Cap PoW 本地求解秒级完成，多账号串行也远用不满 15 分钟
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 清理本工作流历史运行记录（只留本次）
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e -uo pipefail
+          api="https://api.github.com/repos/${{ github.repository }}"
+          auth="Authorization: Bearer $GH_TOKEN"
+          total=0
+          # 一直拉第 1 页：上一批删掉后后面的会顶上来，翻页反而会漏
+          for _round in 1 2 3 4 5; do
+            ids=$(curl -sS -H "$auth" -H "Accept: application/vnd.github+json" \
+              "$api/actions/workflows/checkin-eoos.yml/runs?per_page=100&page=1" \
+              | python -c "import json,sys; print('\n'.join(str(r['id']) for r in json.load(sys.stdin).get('workflow_runs', []) if str(r['id']) != sys.argv[1]))" "$RUN_ID")
+            if [ -z "$ids" ]; then
+              break
+            fi
+            for id in $ids; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/actions/runs/$id")
+              echo "删除 run $id -> $code"
+              if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+                echo "没有 actions:write 权限或该 run 已不存在，停止清理"
+                break 2
+              fi
+              total=$((total + 1))
+            done
+          done
+          echo "已清理 $total 条历史运行，只留本次（run $RUN_ID）"
+
+      - name: 安装依赖（纯 API，无浏览器无 xvfb）
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q requests
+
+      - name: 执行签到
+        env:
+          TZ: Asia/Shanghai
+          # —— 多账号（推荐）：Secret EOOS_ACCOUNTS，格式 `用户名1:密码1;用户名2:密码2` ——
+          EOOS_ACCOUNTS: ${{ secrets.EOOS_ACCOUNTS }}
+          # —— 单账号（兼容；配了 EOOS_ACCOUNTS 时可留空）——
+          EOOS_USERNAME: ${{ secrets.EOOS_USERNAME }}
+          EOOS_PASSWORD: ${{ secrets.EOOS_PASSWORD }}
+          # TG 复用 hohai 的同名 Secret；只发 TG 不上传任何截图
+          EOOS_TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          EOOS_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # —— 可选（同名 Variables；没建就是空）——
+          EOOS_BASE_URL: ${{ vars.EOOS_BASE_URL }}
+          EOOS_TG_PROXY: ${{ vars.EOOS_TG_PROXY }}
+          EOOS_ACCOUNT_DELAY: ${{ vars.EOOS_ACCOUNT_DELAY }}
+          # 已签到时不重复推 TG
+          EOOS_QUIET_ALREADY: "true"
+        run: python -u eoos_checkin.py
+
+      - name: 上传运行日志（账号已打码，无截图）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eoos-logs-${{ github.run_id }}
+          path: logs/
+          if-no-files-found: ignore
+          retention-days: 7
