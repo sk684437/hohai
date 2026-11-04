@@ -2,9 +2,9 @@ name: HOHAI 每日签到
 
 on:
   schedule:
-    # UTC 00:05 = 北京时间 08:05，每天一次
+    # UTC 16:05 = 北京时间 00:05，每天一次
     # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
-    - cron: "0 16 * * *"
+    - cron: "5 16 * * *"
   workflow_dispatch:
     inputs:
       force:
@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write  # 🚨 修改为 write 以允许更新 README 保活
   # 删历史 run 需要它：删 run 会连它的日志和 artifact 一起清掉
   actions: write
 
@@ -117,6 +117,18 @@ jobs:
         run: |
           xvfb-run -a -s "-screen 0 1920x1080x24" \
             python -u hohai_checkin.py ${{ inputs.force && '--force' || '' }}
+
+      - name: 📝 更新 README 时间 (防止 Action 休眠)
+        if: always()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          touch README.md
+          sed -i '/^> 🕒 最后运行时间:/d' README.md
+          CURRENT_TIME=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
+          echo "> 🕒 最后运行时间: $CURRENT_TIME" >> README.md
+          git add README.md
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 更新签到时间保活 [skip ci]" && git push)
 
       - name: 上传截图与日志
         if: always()
