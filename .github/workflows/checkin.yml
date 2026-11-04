@@ -1,0 +1,92 @@
+name: HOHAI 每日签到
+
+on:
+  schedule:
+    # UTC 00:05 = 北京时间 08:05，每天一次
+    # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
+    - cron: "5 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "今日已签到也强制打开浏览器走一遍（调试用）"
+        type: boolean
+        default: false
+
+# 同一时间只跑一个，避免两次运行同时点签到
+concurrency:
+  group: hohai-checkin
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 准备真实 Chrome 与虚拟屏
+        run: |
+          set -e
+          if ! command -v google-chrome >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq wget gnupg
+            wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
+              | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
+              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq google-chrome-stable
+          fi
+          sudo apt-get install -y -qq xvfb fonts-noto-cjk >/dev/null
+          google-chrome --version
+          echo "---"
+          # Turnstile 的挑战域名必须直连可达，否则盾永远过不去
+          curl -s -o /dev/null -w "challenges.cloudflare.com -> %{http_code}\n" https://challenges.cloudflare.com/turnstile/v0/api.js || true
+
+      - name: 安装 Python 依赖
+        run: |
+          python -m pip install --upgrade pip -q
+          pip install -q -r requirements.txt
+
+      - name: 执行签到（真实 Chrome + CDP 接管，xvfb 虚拟屏）
+        env:
+          TZ: Asia/Shanghai
+          # —— 必填（Settings → Secrets and variables → Actions → Secrets）——
+          HOHAI_USERNAME: ${{ secrets.HOHAI_USERNAME }}
+          HOHAI_PASSWORD: ${{ secrets.HOHAI_PASSWORD }}
+          # 注意：Secret 名叫 TG_BOT_TOKEN，脚本读的环境变量叫 HOHAI_TG_BOT_TOKEN
+          HOHAI_TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          HOHAI_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # —— 可选（同名 Variables；没建就是空，脚本自动用默认值）——
+          HOHAI_BASE_URL: ${{ vars.HOHAI_BASE_URL }}
+          HOHAI_PROXY: ${{ vars.HOHAI_PROXY }}
+          HOHAI_TG_PROXY: ${{ vars.HOHAI_TG_PROXY }}
+          HOHAI_TIMEOUT: ${{ vars.HOHAI_TIMEOUT }}
+          HOHAI_HEADLESS: ${{ vars.HOHAI_HEADLESS }}
+          HOHAI_USE_CDP: ${{ vars.HOHAI_USE_CDP }}
+          HOHAI_NO_SANDBOX: ${{ vars.HOHAI_NO_SANDBOX }}
+          HOHAI_KEEP_OPEN: ${{ vars.HOHAI_KEEP_OPEN }}
+          # 已签到时不重复推 TG（本地计划任务与 Actions 双跑时只推一次）
+          HOHAI_QUIET_ALREADY: "true"
+        run: |
+          xvfb-run -a -s "-screen 0 1920x1080x24" \
+            python -u hohai_checkin.py ${{ inputs.force && '--force' || '' }}
+
+      - name: 上传截图与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hohai-screenshots-${{ github.run_id }}
+          path: |
+            screenshots/
+            logs/
+          if-no-files-found: ignore
+          retention-days: 7
