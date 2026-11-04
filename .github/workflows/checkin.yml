@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 00:05 = 北京时间 08:05，每天一次
     # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
-    - cron: "5 0 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       force:
