@@ -1,20 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-HOHAI (tv.hohai.eu.org) 每日签到 —— 模拟点击版
-
-原理（对应站点前端 UserDashboard 的真实逻辑）：
-  1. POST /api/auth/login            -> 拿 auth_token（登录本身不需要人机验证）
-  2. 打开 /dashboard，卡片 [data-checkin-card="dashboard"] 点「立即签到」
-  3. 前端弹出「签到验证」对话框，内含 Cloudflare Turnstile（siteKey 0x4AAAAAABpsP-KNPAFaCaak）
-  4. 脚本点击 Turnstile 复选框（元素点击 -> 坐标点击兜底）拿到 token
-  5. 前端自动 POST /api/checkin {verificationToken}，脚本监听响应判定结果
-  6. 若前端没提交但已拿到 token，脚本用 requests 直接补一次 POST /api/checkin
-
-依赖： pip install requests patchright
-运行： python hohai_checkin.py
-       python hohai_checkin.py --status
-"""
 
 from __future__ import annotations
 
@@ -23,6 +8,7 @@ import configparser
 import json
 import os
 import random
+import re
 import socket
 import subprocess
 import sys
@@ -65,6 +51,12 @@ DEFAULT_UA = (
 
 CF_IFRAME = 'iframe[src*="challenges.cloudflare.com"]'
 CARD = '[data-checkin-card="dashboard"]'
+
+# 每个账号允许覆盖的全局配置键
+ACCOUNT_OVERRIDE_KEYS = (
+    "proxy", "tg_bot_token", "tg_chat_id", "tg_proxy",
+    "headless", "timeout", "use_cdp", "keep_open",
+)
 
 # 读取 Turnstile 通过后生成的 token（兼容自定义 container 与隐藏 input）
 READ_TOKEN_JS = """
@@ -125,11 +117,16 @@ HOOK_JS = """
 })();
 """
 
-STATE = {"logfile": None, "last_shot": None}
+STATE = {"logfile": None, "last_shot": None, "account": None}
+
+
+def _acct_tag() -> str:
+    a = STATE.get("account")
+    return f"[{a}] " if a else ""
 
 
 def log(msg: str) -> None:
-    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {_acct_tag()}{msg}"
     print(line, flush=True)
     if STATE["logfile"]:
         try:
@@ -137,6 +134,10 @@ def log(msg: str) -> None:
                 fh.write(line + "\n")
         except Exception:
             pass
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_", str(s))[:40] or "acct"
 
 
 # ---------------------------------------------------------------- 配置
@@ -154,6 +155,7 @@ def load_config() -> dict:
         "tg_proxy": "",
         "use_cdp": "true",
         "keep_open": "false",
+        "account_delay": "",
     }
     ini = ROOT / "config.ini"
     if ini.exists():
@@ -175,6 +177,7 @@ def load_config() -> dict:
         "HOHAI_TG_PROXY": "tg_proxy",
         "HOHAI_USE_CDP": "use_cdp",
         "HOHAI_KEEP_OPEN": "keep_open",
+        "HOHAI_ACCOUNT_DELAY": "account_delay",
         # 兼容常见别名
         "EMAIL": "username",
         "PASSWORD": "password",
@@ -188,6 +191,84 @@ def load_config() -> dict:
         if val:
             cfg[key] = val.strip()
     return cfg
+
+
+def _split_user_pass(raw: str) -> tuple[str, str]:
+    """`user:pass` 按第一个冒号切，密码里可以再带冒号。"""
+    raw = (raw or "").strip()
+    if ":" in raw:
+        u, p = raw.split(":", 1)
+        return u.strip(), p.strip()
+    return raw, ""
+
+
+def load_accounts(cfg: dict) -> list[dict]:
+    """合并各来源账号，按用户名去重（先出现的优先）。
+
+    返回 [{label, username, password, overrides{...}}]，overrides 只含 ACCOUNT_OVERRIDE_KEYS。
+    """
+    entries: list[dict] = []
+    seen: set[str] = set()
+
+    def add(label: str, username: str, password: str, overrides: dict | None = None) -> None:
+        username = (username or "").strip()
+        if not username:
+            return
+        if username in seen:
+            log(f"账号 {username} 重复配置，忽略后出现的（标签 {label}）")
+            return
+        seen.add(username)
+        entries.append({
+            "label": (label or username).strip(),
+            "username": username,
+            "password": (password or "").strip(),
+            "overrides": overrides or {},
+        })
+
+    ini = ROOT / "config.ini"
+    cp = configparser.ConfigParser()
+    if ini.exists():
+        cp.read(ini, encoding="utf-8")
+
+    # 1) [accounts] 段：`标签 = 用户名:密码`
+    if cp.has_section("accounts"):
+        for key, val in cp.items("accounts"):
+            u, p = _split_user_pass(val)
+            add(key.strip(), u, p)
+
+    # 2) 环境变量 HOHAI_ACCOUNTS：`user:pass` 用 ; 或换行分隔（CI 用）
+    env_accounts = os.environ.get("HOHAI_ACCOUNTS", "").strip()
+    if env_accounts:
+        for item in re.split(r"[;\r\n]+", env_accounts):
+            item = item.strip()
+            if not item:
+                continue
+            u, p = _split_user_pass(item)
+            add(u, u, p)
+
+    # 3) [account.标签] 段：直写 username/password，可覆盖全局键
+    for sec in cp.sections():
+        m = re.match(r"^account\.(.+)$", sec, re.IGNORECASE)
+        if not m:
+            continue
+        label = m.group(1).strip()
+        username = cp.get(sec, "username", fallback="").strip()
+        password = cp.get(sec, "password", fallback="").strip()
+        overrides = {k: cp.get(sec, k, fallback="").strip()
+                     for k in ACCOUNT_OVERRIDE_KEYS if cp.get(sec, k, fallback="").strip()}
+        target = next((e for e in entries if e["username"] == username and username), None)
+        if target:
+            target["overrides"].update(overrides)
+            target["label"] = label
+            log(f"账号 {username} 的覆盖配置已合并（标签 {label}）")
+        else:
+            add(label, username, password, overrides)
+
+    # 4) 兼容旧版单账号（[hohai] username/password 或 HOHAI_USERNAME/HOHAI_PASSWORD）
+    if not entries and cfg.get("username"):
+        add("default", cfg["username"], cfg["password"])
+
+    return entries
 
 
 def truthy(val) -> bool:
@@ -421,7 +502,7 @@ def _reset_turnstile(page) -> bool:
 def _shoot(page, name: str) -> None:
     try:
         SHOT_DIR.mkdir(parents=True, exist_ok=True)
-        path = SHOT_DIR / f"{name}_{datetime.now():%Y%m%d_%H%M%S}.png"
+        path = SHOT_DIR / f"{_safe_name(STATE.get('account') or 'acct')}_{name}_{datetime.now():%Y%m%d_%H%M%S}.png"
         page.screenshot(path=str(path))
         STATE["last_shot"] = str(path)
     except Exception:
@@ -765,74 +846,42 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                 log("真实 Chrome 已退出")
 
 
-# ---------------------------------------------------------------- 主流程
+# ---------------------------------------------------------------- 单账号流程
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="HOHAI 每日签到（模拟点击）")
-    ap.add_argument("--status", action="store_true", help="只查询签到状态")
-    ap.add_argument("--headed", action="store_true", help="强制显示浏览器窗口")
-    ap.add_argument("--smoke", action="store_true", help="只测试浏览器能否启动")
-    ap.add_argument("--token", default="", help="直接使用已有 auth_token（跳过账号密码登录，调试用）")
-    ap.add_argument("--force", action="store_true", help="即使今日已签到也打开浏览器走一遍（调试用）")
-    args = ap.parse_args()
-
-    cfg = load_config()
-    if args.headed:
-        cfg["headless"] = "false"
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    STATE["logfile"] = LOG_DIR / f"checkin_{datetime.now():%Y%m%d}.log"
-
-    log(f"=== HOHAI 签到开始（引擎 {ENGINE or '无'}）===")
-
-    if args.smoke:
-        if sync_playwright is None:
-            log("未安装 patchright/playwright")
-            return 1
-        with sync_playwright() as p:
-            try:
-                b = p.chromium.launch(channel="chrome", headless=False)
-                pg = b.new_context().new_page()
-                pg.goto(cfg["base_url"] + "/login", wait_until="domcontentloaded", timeout=60000)
-                log(f"浏览器可用，页面标题：{pg.title()}")
-                b.close()
-                return 0
-            except Exception as exc:
-                log(f"浏览器启动失败：{exc}")
-                return 1
+def run_account(cfg: dict, args) -> dict:
+    """跑一个账号的完整流程，返回汇总 dict。"""
+    res = {"code": 1, "ok": False, "already": False, "amount": None, "currency": None,
+           "balance": None, "reason": ""}
 
     sess = make_session(cfg)
-    token = (args.token or os.environ.get("HOHAI_TOKEN") or "").strip()
+    token = (getattr(args, "token", "") or os.environ.get("HOHAI_TOKEN") or "").strip()
     if token:
         log("使用外部传入的 auth_token，跳过登录")
     else:
         if not cfg["username"] or not cfg["password"]:
-            log("缺少账号或密码：请在 config.ini 或环境变量 HOHAI_USERNAME / HOHAI_PASSWORD 中配置")
-            return 2
+            res["reason"] = "缺少账号或密码（config.ini [accounts] / HOHAI_ACCOUNTS / HOHAI_USERNAME）"
+            log(res["reason"])
+            return res
         try:
             token = api_login(sess, cfg)
         except Exception as exc:
             log(str(exc))
-            notify(cfg, f"HOHAI 签到失败：登录异常\n{exc}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
-            return 3
+            res["reason"] = f"登录异常：{exc}"
+            return res
 
     st = api_status(sess, cfg, token)
     log(f"签到状态：{json.dumps(st, ensure_ascii=False)[:300]}")
 
     if st.get("hasCheckedInToday") and not args.force:
-        msg = f"HOHAI 今日已签到（{st.get('amount')} {st.get('currencyUnit')}）\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}"
-        log(msg.replace("\n", " | "))
-        balance = st.get("balance")
-        if balance is not None:
-            msg += f"\n余额：{balance} {st.get('currencyUnit') or ''}".rstrip()
-        if truthy(os.environ.get("HOHAI_QUIET_ALREADY", "")):
-            log("已签到且设置了 HOHAI_QUIET_ALREADY，跳过通知")
-            return 0
-        notify(cfg, msg, photo=STATE.get("last_shot"))
-        return 0
+        res.update(code=0, ok=True, already=True,
+                   amount=st.get("amount"), currency=st.get("currencyUnit"),
+                   balance=st.get("balance"))
+        log("今日已签到")
+        return res
     if args.status:
+        res.update(code=0, ok=st.get("hasCheckedInToday"), reason="仅查询模式")
         log("仅查询模式，结束")
-        return 0
+        return res
 
     result = browser_checkin(cfg, token)
 
@@ -857,25 +906,134 @@ def main() -> int:
             result["currency"] = st2.get("currencyUnit", result.get("currency"))
 
     if result.get("ok"):
-        if result.get("already"):
-            text = f"HOHAI 今日已签到（重复执行）\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}"
-        else:
-            text = (
-                f"HOHAI 签到成功\n"
-                f"奖励：+{result.get('amount')} {result.get('currency')}\n"
-                f"时间：{datetime.now():%Y-%m-%d %H:%M:%S}"
-            )
-            balance = st2.get("balance") or result.get("balance")
-            if balance is not None:
-                text += f"\n余额：{balance} {result.get('currency') or ''}".rstrip()
-        log(text.replace("\n", " | "))
-        notify(cfg, text, photo=STATE.get("last_shot"))
+        res.update(code=0, ok=True, already=bool(result.get("already")),
+                   amount=result.get("amount"), currency=result.get("currency"),
+                   balance=st2.get("balance") or result.get("balance"))
+        if not result.get("already"):
+            log(f"签到成功：+{result.get('amount')} {result.get('currency')}")
+        return res
+
+    res["reason"] = result.get("reason") or "未知原因"
+    log(f"签到失败：{res['reason']}")
+    return res
+
+
+def _acc_text(res: dict) -> str:
+    """把单账号结果拼成一行可读文本。"""
+    if res.get("ok") and res.get("already"):
+        return "已签到（重复执行）"
+    if res.get("ok"):
+        line = f"签到成功，奖励 +{res.get('amount')} {res.get('currency') or ''}".rstrip()
+        if res.get("balance") is not None:
+            line += f"，余额 {res['balance']} {res.get('currency') or ''}".rstrip()
+        return line
+    return f"失败：{res.get('reason') or '未知原因'}"
+
+
+# ---------------------------------------------------------------- 主流程
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="HOHAI 每日签到（模拟点击，多账号）")
+    ap.add_argument("--status", action="store_true", help="只查询签到状态，不签到")
+    ap.add_argument("--headed", action="store_true", help="强制显示浏览器窗口")
+    ap.add_argument("--smoke", action="store_true", help="只测试浏览器能否启动")
+    ap.add_argument("--token", default="", help="直接使用已有 auth_token（跳过账号密码登录，调试用）")
+    ap.add_argument("--force", action="store_true", help="即使今日已签到也打开浏览器走一遍（调试用）")
+    ap.add_argument("--account", default="", help="只跑指定账号：标签、用户名或序号（1 起）")
+    ap.add_argument("--list", action="store_true", help="列出已配置的账号后退出")
+    args = ap.parse_args()
+
+    cfg = load_config()
+    accounts = load_accounts(cfg)
+
+    if args.list:
+        log(f"共配置 {len(accounts)} 个账号：")
+        for i, acc in enumerate(accounts):
+            extra = f"（覆盖：{', '.join(sorted(acc['overrides']))}）" if acc["overrides"] else ""
+            log(f"  {i + 1}. [{acc['label']}] {acc['username']}{extra}")
         return 0
 
-    reason = result.get("reason") or "未知原因"
-    log(f"签到失败：{reason}")
-    notify(cfg, f"HOHAI 签到失败：{reason}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}", photo=STATE.get("last_shot"))
-    return 1
+    if args.account:
+        key = args.account.strip()
+        picked = None
+        if key.isdigit() and 1 <= int(key) <= len(accounts):
+            picked = [accounts[int(key) - 1]]
+        if picked is None:
+            picked = [a for a in accounts if a["label"] == key or a["username"] == key]
+        if not picked:
+            log(f"找不到账号：{key}（可用 --list 查看）")
+            return 2
+        accounts = picked
+
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE["logfile"] = LOG_DIR / f"checkin_{datetime.now():%Y%m%d}.log"
+
+    log(f"=== HOHAI 签到开始（引擎 {ENGINE or '无'}，账号 {len(accounts)} 个）===")
+
+    if args.smoke:
+        if sync_playwright is None:
+            log("未安装 patchright/playwright")
+            return 1
+        with sync_playwright() as p:
+            try:
+                b = p.chromium.launch(channel="chrome", headless=False)
+                pg = b.new_context().new_page()
+                pg.goto(cfg["base_url"] + "/login", wait_until="domcontentloaded", timeout=60000)
+                log(f"浏览器可用，页面标题：{pg.title()}")
+                b.close()
+                return 0
+            except Exception as exc:
+                log(f"浏览器启动失败：{exc}")
+                return 1
+
+    if not accounts:
+        log("未配置任何账号：请在 config.ini [accounts] 段、[account.*] 段或环境变量 HOHAI_ACCOUNTS 中配置")
+        return 2
+
+    delay_raw = str(cfg.get("account_delay") or "").strip()
+    summary: list[tuple[str, dict]] = []
+    t0 = time.time()
+
+    for i, acc in enumerate(accounts):
+        cfg_i = dict(cfg)
+        cfg_i.update(acc["overrides"])
+        cfg_i["username"] = acc["username"]
+        cfg_i["password"] = acc["password"]
+        if args.headed:
+            cfg_i["headless"] = "false"
+        STATE["account"] = acc["label"]
+        STATE["last_shot"] = None
+
+        log(f"─── 账号 {i + 1}/{len(accounts)}：{acc['label']} ───")
+        res = run_account(cfg_i, args)
+        summary.append((acc["label"], res))
+
+        # 每个账号单独推一条（带账号前缀 + 各自截图）
+        body = _acc_text(res)
+        notify(cfg_i, f"[{acc['label']}] HOHAI {body}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
+               photo=STATE.get("last_shot"))
+
+        if i < len(accounts) - 1:
+            try:
+                delay = float(delay_raw) if delay_raw else random.uniform(8, 20)
+            except ValueError:
+                delay = random.uniform(8, 20)
+            log(f"等待 {delay:.0f} 秒后处理下一个账号 ...")
+            time.sleep(delay)
+
+    STATE["account"] = None
+
+    # 汇总日志 + TG 汇总消息
+    ok_n = sum(1 for _, r in summary if r.get("code") == 0)
+    lines = [f"{'✓' if r.get('code') == 0 else '✗'} {label}：{_acc_text(r)}" for label, r in summary]
+    head = f"HOHAI 多账号签到汇总：{ok_n}/{len(summary)} 成功（用时 {time.time() - t0:.0f} 秒）"
+    log(head)
+    for line in lines:
+        log("  " + line)
+    if len(summary) > 1:
+        notify(cfg, head + "\n" + "\n".join(lines) + f"\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
+
+    return 0 if ok_n == len(summary) else 1
 
 
 if __name__ == "__main__":
