@@ -152,6 +152,7 @@ def load_config() -> dict:
         "tg_bot_token": "",
         "tg_chat_id": "",
         "tg_proxy": "",
+        "use_cdp": "true",
         "keep_open": "false",
     }
     ini = ROOT / "config.ini"
@@ -172,6 +173,8 @@ def load_config() -> dict:
         "HOHAI_TG_BOT_TOKEN": "tg_bot_token",
         "HOHAI_TG_CHAT_ID": "tg_chat_id",
         "HOHAI_TG_PROXY": "tg_proxy",
+        "HOHAI_USE_CDP": "use_cdp",
+        "HOHAI_KEEP_OPEN": "keep_open",
         # 兼容常见别名
         "EMAIL": "username",
         "PASSWORD": "password",
