@@ -19,6 +19,8 @@ concurrency:
 
 permissions:
   contents: read
+  # 删历史 run 需要它：删 run 会连它的日志和 artifact 一起清掉
+  actions: write
 
 jobs:
   checkin:
@@ -31,6 +33,42 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+
+      - name: 清理历史运行记录（只留本次）
+        # 每次 run 都是干净机器，会堆的是历史 run 本身：记录、日志、artifact。
+        # 把本次之外的 run 全删掉，仓库里就只剩最新一份。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          # +e：curl 偶发失败不该让整步中断（GitHub 默认 shell 自带 -e）
+          set +e -uo pipefail
+          api="https://api.github.com/repos/${{ github.repository }}"
+          auth="Authorization: Bearer $GH_TOKEN"
+          total=0
+          # 一直拉第 1 页：上一批删掉后后面的会顶上来，翻页反而会漏
+          for _round in 1 2 3 4 5 6 7 8 9 10; do
+            ids=$(curl -sS -H "$auth" -H "Accept: application/vnd.github+json" \
+              "$api/actions/workflows/checkin.yml/runs?per_page=100&page=1" \
+              | python -c "import json,sys; print('\n'.join(str(r['id']) for r in json.load(sys.stdin).get('workflow_runs', []) if str(r['id']) != sys.argv[1]))" "$RUN_ID")
+            if [ -z "$ids" ]; then
+              break
+            fi
+            for id in $ids; do
+              code=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "$api/actions/runs/$id")
+              echo "删除 run $id -> $code"
+              if [ "$code" = "403" ] || [ "$code" = "404" ]; then
+                echo "没有 actions:write 权限或该 run 已不存在，停止清理"
+                break 2
+              fi
+              total=$((total + 1))
+            done
+          done
+          echo "已清理 $total 条历史运行，只留本次（run $RUN_ID）"
+          rest=$(curl -sS -H "$auth" "$api/actions/workflows/checkin.yml/runs?per_page=1" \
+            | python -c "import json,sys; print(json.load(sys.stdin).get('total_count', '?'))")
+          echo "仓库现有运行记录总数：$rest（含本次）"
 
       - name: 准备真实 Chrome 与虚拟屏
         run: |
