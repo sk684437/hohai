@@ -1,35 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-EOOS (eoos.top) 每日签到 —— 纯 API 版（多账号，无浏览器）
-
-站点与 HOHAI 同一套面板，验证码用的是 Cap（trycap.dev，proof-of-work，
-sha256 挖矿题，没有可点的框，浏览器里也是自动算的），所以整个流程
-不需要浏览器：登录 → 领题 → 算 PoW → 换 token → POST /api/checkin。
-
-流程：
-  1. POST /api/auth/login            -> auth_token（响应如提示需要验证码则先解题再重试）
-  2. GET  /api/checkin/status        -> hasCheckedInToday / amount / currencyUnit
-  3. POST /api/cap/challenge         -> {challenge:{c,s,d}, token}  （18 题、盐长 32、难度 4）
-  4. 本地 sha256 求解（盐由 token+序号 经 FNV-1a+xorshift32 派生，已对齐官方 widget）
-  5. POST /api/cap/redeem            -> verificationToken
-  6. POST /api/checkin {verificationToken} -> amount / currencyUnit / balance
-  7. GET  /api/checkin/status        -> 复核签到生效
-
-多账号配置（与 hohai_checkin.py 同一套约定，可混用，按用户名去重）：
-  A. config.ini [eoos.accounts] 段，每行 `标签 = 用户名:密码`
-  B. config.ini [eoos.account.标签] 段，username/password 直写，可覆盖 tg_* 项
-  C. 环境变量 EOOS_ACCOUNTS，`用户名:密码` 用 ; 或换行分隔（CI 用）
-  D. 兼容单账号：[eoos] 的 username/password 或 EOOS_USERNAME / EOOS_PASSWORD
-
-账号在日志 / TG 里一律打码（a***@q***#1d07 形态），认不出具体是哪个号。
-
-依赖： pip install requests
-运行： python eoos_checkin.py                # 跑全部账号
-       python eoos_checkin.py --list        # 列出账号（打码显示）
-       python eoos_checkin.py --account 2   # 只跑第 2 个账号
-       python eoos_checkin.py --status      # 只查询不签到
-"""
 
 from __future__ import annotations
 
@@ -116,12 +86,17 @@ def load_config() -> dict:
         "account_delay": "",
     }
     ini = ROOT / "config.ini"
+    hohai_cfg: dict = {}
     if ini.exists():
         cp = configparser.ConfigParser()
         cp.read(ini, encoding="utf-8")
         if cp.has_section("eoos"):
             for k, v in cp.items("eoos"):
                 cfg[k.strip()] = v.strip()
+        # TG 复用 hohai 的 bot：[eoos] 对应项留空时回落到 [hohai] 段同名值
+        if cp.has_section("hohai"):
+            for k, v in cp.items("hohai"):
+                hohai_cfg[k.strip()] = v.strip()
 
     env_map = {
         "EOOS_BASE_URL": "base_url",
@@ -142,6 +117,10 @@ def load_config() -> dict:
         val = os.environ.get(env)
         if val:
             cfg[key] = val.strip()
+
+    for key in ("tg_bot_token", "tg_chat_id", "tg_proxy"):
+        if not cfg.get(key) and hohai_cfg.get(key):
+            cfg[key] = hohai_cfg[key]
     return cfg
 
 
