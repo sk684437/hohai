@@ -26,7 +26,6 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
-SHOT_DIR = ROOT / "screenshots"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -118,7 +117,7 @@ HOOK_JS = """
 })();
 """
 
-STATE = {"logfile": None, "last_shot": None, "account": None}
+STATE = {"logfile": None, "account": None}
 
 
 def _acct_tag() -> str:
@@ -135,10 +134,6 @@ def log(msg: str) -> None:
                 fh.write(line + "\n")
         except Exception:
             pass
-
-
-def _safe_name(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_", str(s))[:40] or "acct"
 
 
 def _mask_account(u: str) -> str:
@@ -362,8 +357,8 @@ def api_checkin(sess: requests.Session, cfg: dict, token: str, vt: str) -> tuple
     return r.status_code, body
 
 
-def notify(cfg: dict, text: str, photo: str | None = None) -> None:
-    """推 Telegram：先发文字，再把截图当照片发过去（同一会话里更直观）。
+def notify(cfg: dict, text: str) -> None:
+    """推 Telegram 文字消息。
 
     tg_proxy 单独配置：国内直连 api.telegram.org 不通，但签到站点反而必须直连，
     两者走不同链路，所以不能共用一个 proxy。
@@ -382,22 +377,9 @@ def notify(cfg: dict, text: str, photo: str | None = None) -> None:
             json={"chat_id": chat, "text": text, "disable_web_page_preview": True},
             timeout=20,
         )
-        log("Telegram 文字已发送" if r.status_code == 200 else f"Telegram 文字发送失败：{r.text[:150]}")
+        log("Telegram 已发送" if r.status_code == 200 else f"Telegram 发送失败：{r.text[:150]}")
     except Exception as exc:
-        log(f"Telegram 文字异常：{exc}")
-
-    if photo and os.path.isfile(photo):
-        try:
-            with open(photo, "rb") as fh:
-                r = sess.post(
-                    f"https://api.telegram.org/bot{tok}/sendPhoto",
-                    data={"chat_id": chat, "caption": os.path.basename(photo)},
-                    files={"photo": fh},
-                    timeout=90,
-                )
-            log("Telegram 截图已发送" if r.status_code == 200 else f"Telegram 截图发送失败：{r.text[:150]}")
-        except Exception as exc:
-            log(f"Telegram 截图异常：{exc}")
+        log(f"Telegram 异常：{exc}")
 
 
 # ---------------------------------------------------------------- 浏览器
@@ -522,16 +504,6 @@ def _reset_turnstile(page) -> bool:
         """))
     except Exception:
         return False
-
-
-def _shoot(page, name: str) -> None:
-    try:
-        SHOT_DIR.mkdir(parents=True, exist_ok=True)
-        path = SHOT_DIR / f"{_safe_name(STATE.get('account') or 'acct')}_{name}_{datetime.now():%Y%m%d_%H%M%S}.png"
-        page.screenshot(path=str(path))
-        STATE["last_shot"] = str(path)
-    except Exception:
-        pass
 
 
 CHROME_CANDIDATES = [
@@ -703,15 +675,13 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                 if _ui_login(page, cfg):
                     entered = _wait_card(page, 60)
             if not entered:
-                _shoot(page, "no_card")
                 result["reason"] = "未进入面板：token 失效或账号密码错误"
                 return result
             log("已进入面板")
             card_text = page.locator(CARD).inner_text()
             if "今日已签到" in card_text:
                 result.update(ok=True, already=True)
-                _shoot(page, "already_done")
-                log("今日已签到（已截图，随后关闭浏览器）")
+                log("今日已签到，随后关闭浏览器")
                 return result
 
             clicked = False
@@ -727,7 +697,6 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                 except Exception:
                     continue
             if not clicked:
-                _shoot(page, "no_button")
                 result["reason"] = "未找到「立即签到」按钮"
                 return result
 
@@ -755,15 +724,11 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                             if body.get("balance") is not None:
                                 result["balance"] = body.get("balance")
                             log(f"签到成功，奖励 {body.get('amount')} {body.get('currencyUnit')}，余额 {body.get('balance')}")
-                            time.sleep(1.5)
-                            _shoot(page, "checkin_success")
-                            log("已截图，随后关闭浏览器")
                             return result
                         if h["status"] == 400 and body.get("hasCheckedIn"):
                             result.update(ok=True, already=True, amount=body.get("amount"))
                             if body.get("balance") is not None:
                                 result["balance"] = body.get("balance")
-                            _shoot(page, "already_done")
                             log("重复签到：今日已签到")
                             return result
 
@@ -776,8 +741,7 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                                 result["balance"] = plain[-1]["body"].get("balance")
                         else:
                             result.update(ok=True, already=True)
-                        _shoot(page, "checkin_success")
-                        log("卡片显示「今日已签到」，已截图")
+                        log("卡片显示「今日已签到」")
                         return result
 
                     # 3) 读取 token（含 hook 到的回调 token）
@@ -808,8 +772,6 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                         if _click_cf(page, frames[-1]):
                             clicks += 1
                             next_click = time.time() + 6
-                            if clicks == 1:
-                                _shoot(page, "after_first_click")
                             time.sleep(random.uniform(3, 5))
                             continue
 
@@ -842,7 +804,6 @@ def browser_checkin(cfg: dict, token: str) -> dict:
                         return result
                     raise
 
-            _shoot(page, "timeout")
             bad = [h for h in hits if not (h["status"] == 200 and h["body"].get("success"))]
             if bad:
                 b = bad[-1]
@@ -854,7 +815,6 @@ def browser_checkin(cfg: dict, token: str) -> dict:
             return result
 
         except Exception as exc:
-            _shoot(page, "exception")
             result["reason"] = f"浏览器流程异常：{exc}"
             return result
         finally:
@@ -1038,20 +998,18 @@ def main() -> int:
         if args.headed:
             cfg_i["headless"] = "false"
         STATE["account"] = acc["label"]
-        STATE["last_shot"] = None
 
         log(f"─── 账号 {i + 1}/{len(accounts)}：{acc['label']} ───")
         res = run_account(cfg_i, args)
         summary.append((acc["label"], res))
 
-        # 每个账号单独推一条（带账号前缀 + 各自截图）；
+        # 每个账号单独推一条（带账号前缀）；
         # HOHAI_QUIET_ALREADY=true 时已签到不推（本地计划任务与 Actions 双跑时避免重复轰炸）
         if res.get("ok") and res.get("already") and truthy(os.environ.get("HOHAI_QUIET_ALREADY", "")):
             log("已签到且设置了 HOHAI_QUIET_ALREADY，跳过该账号通知")
         else:
             body = _acc_text(res)
-            notify(cfg_i, f"[{acc['label']}] HOHAI {body}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-                   photo=STATE.get("last_shot"))
+            notify(cfg_i, f"[{acc['label']}] HOHAI {body}\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
 
         if i < len(accounts) - 1:
             try:
@@ -1070,6 +1028,7 @@ def main() -> int:
     log(head)
     for line in lines:
         log("  " + line)
+    # 汇总消息：多账号才发（单账号以逐账号通知为准；已签静音由 QUIET_ALREADY 控制）
     if len(summary) > 1:
         notify(cfg, head + "\n" + "\n".join(lines) + f"\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
 
