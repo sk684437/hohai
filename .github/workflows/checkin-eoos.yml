@@ -71,7 +71,7 @@ jobs:
           # —— 单账号（兼容；配了 EOOS_ACCOUNTS 时可留空）——
           EOOS_USERNAME: ${{ secrets.EOOS_USERNAME }}
           EOOS_PASSWORD: ${{ secrets.EOOS_PASSWORD }}
-          # TG 复用 hohai 的同名 Secret；只发 TG 不上传任何截图
+          # TG 复用 hohai 的同名 Secret
           EOOS_TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           EOOS_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           # —— 可选（同名 Variables；没建就是空）——
@@ -81,12 +81,3 @@ jobs:
           # 已签到时不重复推 TG
           EOOS_QUIET_ALREADY: "true"
         run: python -u eoos_checkin.py
-
-      - name: 上传运行日志（账号已打码，无截图）
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: eoos-logs-${{ github.run_id }}
-          path: logs/
-          if-no-files-found: ignore
-          retention-days: 7
