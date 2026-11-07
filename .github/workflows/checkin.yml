@@ -1,27 +1,25 @@
-name: HOHAI 每日签到
+name: EOOS 每日签到
 
 on:
   schedule:
-    # UTC 16:05 = 北京时间 00:05，每天一次
+    # UTC 16:35 = 北京时间 00:35，每天一次（与 hohai 的 00:05 错开，避免并发推 TG）
     # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
-    - cron: "5 16 * * *"
+    - cron: "35 16 * * *"
   workflow_dispatch:
 
-# 同一时间只跑一个，避免两次运行同时点签到
+# 同一时间只跑一个，避免两次运行同时提交签到
 concurrency:
-  group: hohai-checkin
+  group: eoos-checkin
   cancel-in-progress: false
 
 permissions:
-  contents: write  # 🚨 修改为 write 以允许更新 README 保活
-  # 删历史 run 需要它：删 run 会连它的日志和 artifact 一起清掉
-  actions: write
+  actions: write  # 删历史 run 用；纯 API 签到无 git push，不需要 contents
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
-    # 多账号串行：每个账号最坏 ~timeout(180s)+浏览器开销，放宽到 60 分钟
-    timeout-minutes: 60
+    # 纯 API 模式：Cap PoW 本地求解秒级完成，多账号串行也远用不满 15 分钟
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,32 +27,29 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: logs
-          key: hohai-state-${{ github.run_id }}
+          key: eoos-state-${{ github.run_id }}
           restore-keys: |
-            hohai-state-
+            eoos-state-
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
-      - name: 清理历史运行记录（只留本次）
-        # 每次 run 都是干净机器，会堆的是历史 run 本身：记录、日志、artifact。
-        # 把本次之外的 run 全删掉，仓库里就只剩最新一份。
+      - name: 清理本工作流历史运行记录（只留本次）
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.run_id }}
         run: |
-          # +e：curl 偶发失败不该让整步中断（GitHub 默认 shell 自带 -e）
           set +e -uo pipefail
           api="https://api.github.com/repos/${{ github.repository }}"
           auth="Authorization: Bearer $GH_TOKEN"
           total=0
           # 一直拉第 1 页：上一批删掉后后面的会顶上来，翻页反而会漏
-          for _round in 1 2 3 4 5 6 7 8 9 10; do
+          for _round in 1 2 3 4 5; do
             ids=$(curl -sS -H "$auth" -H "Accept: application/vnd.github+json" \
-              "$api/actions/workflows/checkin.yml/runs?per_page=100&page=1" \
+              "$api/actions/workflows/checkin-eoos.yml/runs?per_page=100&page=1" \
               | python -c "import json,sys; print('\n'.join(str(r['id']) for r in json.load(sys.stdin).get('workflow_runs', []) if str(r['id']) != sys.argv[1]))" "$RUN_ID")
             if [ -z "$ids" ]; then
               break
@@ -70,74 +65,34 @@ jobs:
             done
           done
           echo "已清理 $total 条历史运行，只留本次（run $RUN_ID）"
-          rest=$(curl -sS -H "$auth" "$api/actions/workflows/checkin.yml/runs?per_page=1" \
-            | python -c "import json,sys; print(json.load(sys.stdin).get('total_count', '?'))")
-          echo "仓库现有运行记录总数：$rest（含本次）"
 
-      - name: 准备真实 Chrome 与虚拟屏
-        run: |
-          set -e
-          if ! command -v google-chrome >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq wget gnupg
-            wget -q -O - https://dl.google.com/linux/linux_signing_key.pub \
-              | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg
-            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] https://dl.google.com/linux/chrome/deb/ stable main" \
-              | sudo tee /etc/apt/sources.list.d/google-chrome.list >/dev/null
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq google-chrome-stable
-          fi
-          sudo apt-get install -y -qq xvfb fonts-noto-cjk >/dev/null
-          google-chrome --version
-          echo "---"
-          # Turnstile 的挑战域名必须直连可达，否则盾永远过不去
-          curl -s -o /dev/null -w "challenges.cloudflare.com -> %{http_code}\n" https://challenges.cloudflare.com/turnstile/v0/api.js || true
-
-      - name: 安装 Python 依赖
+      - name: 安装依赖（纯 API，无浏览器无 xvfb）
         run: |
           python -m pip install --upgrade pip -q
-          pip install -q -r requirements.txt
+          pip install -q requests
 
-      - name: 执行签到（真实 Chrome + CDP 接管，xvfb 虚拟屏）
+      - name: 执行签到
         env:
           TZ: Asia/Shanghai
-          # —— 多账号（推荐）：Secret HOHAI_ACCOUNTS，格式 `用户名1:密码1;用户名2:密码2` ——
-          HOHAI_ACCOUNTS: ${{ secrets.HOHAI_ACCOUNTS }}
-          # —— 单账号（兼容旧配置；配了 HOHAI_ACCOUNTS 时可留空）——
-          HOHAI_USERNAME: ${{ secrets.HOHAI_USERNAME }}
-          HOHAI_PASSWORD: ${{ secrets.HOHAI_PASSWORD }}
-          # 注意：Secret 名叫 TG_BOT_TOKEN，脚本读的环境变量叫 HOHAI_TG_BOT_TOKEN
-          HOHAI_TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          HOHAI_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          # —— 可选（同名 Variables；没建就是空，脚本自动用默认值）——
-          HOHAI_BASE_URL: ${{ vars.HOHAI_BASE_URL }}
-          HOHAI_PROXY: ${{ vars.HOHAI_PROXY }}
-          HOHAI_TG_PROXY: ${{ vars.HOHAI_TG_PROXY }}
-          HOHAI_TIMEOUT: ${{ vars.HOHAI_TIMEOUT }}
-          HOHAI_HEADLESS: ${{ vars.HOHAI_HEADLESS }}
-          HOHAI_USE_CDP: ${{ vars.HOHAI_USE_CDP }}
-          HOHAI_NO_SANDBOX: ${{ vars.HOHAI_NO_SANDBOX }}
-          HOHAI_ACCOUNT_DELAY: ${{ vars.HOHAI_ACCOUNT_DELAY }}
-          # 已签到时不重复推 TG（本地计划任务与 Actions 双跑时只推一次）
-          HOHAI_QUIET_ALREADY: "true"
-        run: |
-          xvfb-run -a -s "-screen 0 1920x1080x24" python -u hohai_checkin.py
-
-      - name: 📝 更新 README 时间 (防止 Action 休眠)
-        if: always()
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          touch README.md
-          sed -i '/^> 🕒 最后运行时间:/d' README.md
-          CURRENT_TIME=$(TZ='Asia/Shanghai' date +'%Y-%m-%d %H:%M:%S')
-          echo "> 🕒 最后运行时间: $CURRENT_TIME" >> README.md
-          git add README.md
-          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 更新签到时间保活 [skip ci]" && git push)
+          # —— 多账号（推荐）：Secret EOOS_ACCOUNTS，格式 `用户名1:密码1;用户名2:密码2` ——
+          EOOS_ACCOUNTS: ${{ secrets.EOOS_ACCOUNTS }}
+          # —— 单账号（兼容；配了 EOOS_ACCOUNTS 时可留空）——
+          EOOS_USERNAME: ${{ secrets.EOOS_USERNAME }}
+          EOOS_PASSWORD: ${{ secrets.EOOS_PASSWORD }}
+          # TG 复用 hohai 的同名 Secret
+          EOOS_TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          EOOS_TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # —— 可选（同名 Variables；没建就是空）——
+          EOOS_BASE_URL: ${{ vars.EOOS_BASE_URL }}
+          EOOS_TG_PROXY: ${{ vars.EOOS_TG_PROXY }}
+          EOOS_ACCOUNT_DELAY: ${{ vars.EOOS_ACCOUNT_DELAY }}
+          # 已签到时不重复推 TG
+          EOOS_QUIET_ALREADY: "true"
+        run: python -u eoos_checkin.py
 
       - name: 保存当日签到结果缓存（key 带 run_id 必存，restore-keys 前缀让下次重跑取到最新一份）
         if: always()
         uses: actions/cache/save@v4
         with:
           path: logs
-          key: hohai-state-${{ github.run_id }}
+          key: eoos-state-${{ github.run_id }}
