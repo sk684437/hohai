@@ -156,11 +156,7 @@ def load_accounts(cfg: dict) -> list[dict]:
     if ini.exists():
         cp.read(ini, encoding="utf-8")
 
-    if cp.has_section("eoos.accounts"):
-        for key, val in cp.items("eoos.accounts"):
-            u, p = _split_user_pass(val)
-            add(key.strip(), u, p)
-
+    # 1) 环境变量 EOOS_ACCOUNTS：`user:pass` 用 ; 或换行分隔（优先级最高）
     env_accounts = os.environ.get("EOOS_ACCOUNTS", "").strip()
     if env_accounts:
         for item in re.split(r"[;\r\n]+", env_accounts):
@@ -169,6 +165,12 @@ def load_accounts(cfg: dict) -> list[dict]:
                 continue
             u, p = _split_user_pass(item)
             add(u, u, p)
+
+    # 2) [eoos.accounts] 段：`标签 = 用户名:密码`
+    if cp.has_section("eoos.accounts"):
+        for key, val in cp.items("eoos.accounts"):
+            u, p = _split_user_pass(val)
+            add(key.strip(), u, p)
 
     for sec in cp.sections():
         m = re.match(r"^eoos\.account\.(.+)$", sec, re.IGNORECASE)
@@ -336,6 +338,48 @@ def notify(cfg: dict, text: str) -> None:
         log(f"Telegram 异常：{exc}")
 
 
+# ---------------------------------------------------------------- 当日结果缓存
+# 奖励/余额只在签到 POST 响应里带一次，/api/checkin/status 已签状态下不返回这些值。
+# 当天实签成功就把数值落盘，同日重跑时「今日已签到」的账号从缓存回显完整通知。
+
+def _state_file() -> Path:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    return LOG_DIR / f"state_eoos_{datetime.now():%Y%m%d}.json"
+
+
+def state_record(username: str, res: dict) -> None:
+    try:
+        if res.get("amount") is None:
+            return
+        f = _state_file()
+        try:
+            store = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            store = {}
+        store[hashlib.md5(username.encode("utf-8")).hexdigest()] = {
+            "label": _mask_account(username),
+            "amount": res.get("amount"), "currency": res.get("currency"),
+            "balance": res.get("balance"),
+        }
+        f.write_text(json.dumps(store, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def state_fill(username: str, res: dict) -> None:
+    """已签到且本次没拿到奖励数值时，用当日缓存补全 amount/currency/balance。"""
+    if not (res.get("ok") and res.get("already") and res.get("amount") is None):
+        return
+    try:
+        store = json.loads(_state_file().read_text(encoding="utf-8"))
+        rec = store.get(hashlib.md5(username.encode("utf-8")).hexdigest()) or {}
+        for k in ("amount", "currency", "balance"):
+            if rec.get(k) is not None:
+                res[k] = rec[k]
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- 单账号流程
 
 def run_account(cfg: dict, args) -> dict:
@@ -360,6 +404,7 @@ def run_account(cfg: dict, args) -> dict:
     if st.get("hasCheckedInToday"):
         res.update(code=0, ok=True, already=True,
                    amount=st.get("amount"), currency=st.get("currencyUnit"))
+        state_fill(cfg["username"], res)
         log("今日已签到")
         return res
     if args.status:
@@ -400,6 +445,10 @@ def run_account(cfg: dict, args) -> dict:
         else:
             res["amount"] = st2.get("amount", res.get("amount"))
             res["currency"] = st2.get("currencyUnit", res.get("currency"))
+    if res.get("ok"):
+        # 当日缓存：实签成功的直接记录；已签但带出数值的（400 响应）也记录，供后续重跑回显
+        state_record(cfg["username"], res)
+        state_fill(cfg["username"], res)
     return res
 
 
@@ -494,6 +543,7 @@ def main() -> int:
     log(head)
     for line in lines:
         log("  " + line)
+    # 汇总消息：多账号才发（单账号以逐账号通知为准；已签静音由 QUIET_ALREADY 控制）
     if len(summary) > 1:
         notify(cfg, head + "\n" + "\n".join(lines) + f"\n时间：{datetime.now():%Y-%m-%d %H:%M:%S}")
 
