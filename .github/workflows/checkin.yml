@@ -4,7 +4,7 @@ on:
   schedule:
     # UTC 16:05 = 北京时间 00:05，每天一次
     # GitHub 的定时任务高峰期会延迟 5~30 分钟，属正常现象
-    - cron: "2 16 * * *"
+    - cron: "5 16 * * *"
   workflow_dispatch:
 
 # 同一时间只跑一个，避免两次运行同时点签到
@@ -24,6 +24,14 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - name: 恢复当日签到结果缓存（同日重跑时「今日已签到」账号回显奖励/余额）
+        uses: actions/cache/restore@v4
+        with:
+          path: logs
+          key: hohai-state-${{ github.run_id }}
+          restore-keys: |
+            hohai-state-
 
       - uses: actions/setup-python@v5
         with:
@@ -126,3 +134,10 @@ jobs:
           echo "> 🕒 最后运行时间: $CURRENT_TIME" >> README.md
           git add README.md
           git diff --quiet && git diff --staged --quiet || (git commit -m "chore: 更新签到时间保活 [skip ci]" && git push)
+
+      - name: 保存当日签到结果缓存（key 带 run_id 必存，restore-keys 前缀让下次重跑取到最新一份）
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: logs
+          key: hohai-state-${{ github.run_id }}
